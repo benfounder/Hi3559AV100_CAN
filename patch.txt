@@ -1,8 +1,8 @@
 diff --git a/arch/arm64/boot/dts/hisilicon/hi3559av100.dtsi b/arch/arm64/boot/dts/hisilicon/hi3559av100.dtsi
-index ccffd45..6d1fb20 100644
+index 117937f..b0b7e58 100644
 --- a/arch/arm64/boot/dts/hisilicon/hi3559av100.dtsi
 +++ b/arch/arm64/boot/dts/hisilicon/hi3559av100.dtsi
-@@ -1327,5 +1327,26 @@
+@@ -1342,5 +1342,26 @@
                  interrupt-names = "hi-wdg";
          };
  
@@ -60,10 +60,10 @@ index 26ba4b7..171e316 100644
  subdir-ccflags-$(CONFIG_CAN_DEBUG_DEVICES) += -DDEBUG
 diff --git a/drivers/net/can/hi3559av100_can.c b/drivers/net/can/hi3559av100_can.c
 new file mode 100644
-index 0000000..51f519d
+index 0000000..f53f56d
 --- /dev/null
 +++ b/drivers/net/can/hi3559av100_can.c
-@@ -0,0 +1,685 @@
+@@ -0,0 +1,691 @@
 +/*
 + * hi3559av100_can.c - CAN network driver for Hisilicon 3559A Soc CAN controller
 + *
@@ -86,6 +86,7 @@ index 0000000..51f519d
 +#include <linux/string.h>
 +#include <linux/types.h>
 +#include <linux/printk.h>
++#include <linux/spinlock.h>
 +
 +#include <linux/can/dev.h>
 +#include <linux/can/error.h>
@@ -132,6 +133,7 @@ index 0000000..51f519d
 +struct hisi_can_priv {
 +    struct can_priv can;		/* must be the first member */
 +    void __iomem *reg_base;
++    spinlock_t lock;
 +    u32 free_mailbox;
 +    u32 can_status;
 +};
@@ -365,16 +367,17 @@ index 0000000..51f519d
 +    irqreturn_t handled = IRQ_NONE;
 +    struct sk_buff *skb;
 +    struct can_frame *cf;
-+    u32 reg_status, reg_interrupt, reg_tmp, reg_pending, index;
++    u32 reg_status, reg_interrupt, reg_tmp, reg_pending, index, tmp;
++    unsigned long flags;
 +
-+    reg_status = readl(priv->reg_base + CAN_STATUS);
 +    reg_interrupt = readl(priv->reg_base + CAN_INTERRUPT);
 +    handled = IRQ_HANDLED;
-+    printk(KERN_ERR "%s:%d reg_interrupt 0x%x\n", __FUNCTION__, __LINE__, reg_interrupt);
-+    printk(KERN_ERR "%s:%d reg_status 0x%x\n", __FUNCTION__, __LINE__, reg_status);
-+    writel(0x7, priv->reg_base + CAN_STATUS);
++    //printk(KERN_ERR "%s:%d reg_interrupt 0x%x\n", __FUNCTION__, __LINE__, reg_interrupt);
 +    /* Check Error */
 +    if (reg_interrupt == 0x8000) {
++        reg_status = readl(priv->reg_base + CAN_STATUS);
++        //printk(KERN_ERR "%s:%d reg_status 0x%x\n", __FUNCTION__, __LINE__, reg_status);
++        writel(0x7, priv->reg_base + CAN_STATUS);
 +        reg_tmp = priv->can_status ^ reg_status;
 +        if (reg_tmp & 0x80) {
 +            /* Boff change */
@@ -397,11 +400,11 @@ index 0000000..51f519d
 +                hisi_can_error(cf);
 +#endif
 +                /* restart controller */
-+                reg_tmp = readl(priv->reg_base+CAN_CONTROL);
++                reg_tmp = readl(priv->reg_base + CAN_CONTROL);
 +                reg_tmp |= 0x1;
-+                writel(reg_tmp, priv->reg_base+CAN_CONTROL);
++                writel(reg_tmp, priv->reg_base + CAN_CONTROL);
 +                reg_tmp &= 0xFFFFFFFE;
-+                writel(reg_tmp, priv->reg_base+CAN_CONTROL);
++                writel(reg_tmp, priv->reg_base + CAN_CONTROL);
 +            } else {
 +                /* bus-on */
 +                netdev_dbg(dev, "restarted\n");
@@ -424,55 +427,53 @@ index 0000000..51f519d
 +        }
 +#endif
 +        priv->can_status = reg_status;
-+    }
++    } else if ((reg_interrupt <= 0x20) && (reg_interrupt > 0)) {
++        /* Clean Interrupt */
++        //readl(priv->reg_base + IF2_COMMAND_MASK);
++        //readl(priv->reg_base + IF2_COMMAND_REQUEST);
++        reg_tmp = readl(priv->reg_base + INTERRUPT_PENDING1);
++        reg_pending = reg_tmp;
++        reg_tmp = readl(priv->reg_base + INTERRUPT_PENDING2);
++        reg_pending |= reg_tmp << 16;
 +
-+    /* Check Receive Complete */
-+    if (0x10 == (reg_status & 0x10)) {
-+        if ((reg_interrupt < 0x20) && (reg_interrupt > 0)) {
-+            reg_tmp = readl(priv->reg_base + INTERRUPT_PENDING1);
-+            reg_pending = reg_tmp;
-+            reg_tmp = readl(priv->reg_base + INTERRUPT_PENDING2);
-+            reg_pending |= reg_tmp << 16;
-+            reg_pending &= std_recv_map;
-+            if (reg_pending) {
-+                for (index = 0; index < 32; index++) {
-+                    if (reg_pending & (1UL << index)) {
-+                        skb = alloc_can_skb(dev, &cf);
-+                        if (unlikely(!skb)) {
-+                            stats->rx_dropped++;
-+                            goto exit;
-+                        }
-+                        hisi_can_read(priv, index+1, cf);
-+                        hisi_can_preread(priv, index+1);
-+                        stats->rx_packets++;
-+                        stats->rx_bytes += cf->can_dlc;
-+                        netif_rx(skb);
-+                        can_led_event(dev, CAN_LED_EVENT_RX);
-+                    }
++        /* Check Transmit Complete */
++        reg_tmp  = reg_pending & all_send_map;
++        //printk(KERN_ERR "%s:%d TX pending 0x%x\n", __FUNCTION__, __LINE__, reg_tmp);
++        if (reg_tmp) {
++            for (index = send_start_index; index < 32; index++) {
++                if (reg_tmp & (1UL << index)) {
++                    hisi_can_write_finish(priv, index + 1);
++                    can_get_echo_skb(dev, (index - send_start_index));
++                    stats->tx_packets++;
++                    can_led_event(dev, CAN_LED_EVENT_TX);
++                    spin_lock_irqsave(&(priv->lock), flags);
++                    tmp = priv->free_mailbox;
++                    priv->free_mailbox |= 1UL << index;
++                    if (0 == tmp)
++                        netif_wake_queue(dev);
++                    spin_unlock_irqrestore(&(priv->lock), flags);
 +                }
 +            }
 +        }
-+    }
 +
-+    /* Check Transmit Complete */
-+    if (0x08 == (reg_status & 0x08)) {
-+        if ((reg_interrupt < 0x20) && (reg_interrupt > 0)) {
-+            reg_tmp = readl(priv->reg_base + INTERRUPT_PENDING1);
-+            reg_pending = reg_tmp;
-+            reg_tmp = readl(priv->reg_base + INTERRUPT_PENDING2);
-+            reg_pending |= reg_tmp << 16;
-+            reg_pending &= all_send_map;
-+            if (reg_pending) {
-+                for (index = send_start_index; index < 32; index++) {
-+                    if (reg_pending & (1UL << index)) {
-+                        hisi_can_write_finish(priv, index+1);
-+                        can_get_echo_skb(dev, (index - send_start_index));
-+                        stats->tx_packets++;
-+                        can_led_event(dev, CAN_LED_EVENT_TX);
-+                        if (0 == priv->free_mailbox)
-+                            netif_wake_queue(dev);
-+                        priv->free_mailbox |= 1UL << index;
++        /* Check Receive Complete */
++        reg_tmp = reg_pending & std_recv_map;
++        //printk(KERN_ERR "%s:%d RX pending 0x%x\n", __FUNCTION__, __LINE__, reg_tmp);
++        if (reg_tmp) {
++            for (index = 0; index < send_start_index; index++) {
++                if (reg_tmp & (1UL << index)) {
++                    skb = alloc_can_skb(dev, &cf);
++                    if (unlikely(!skb)) {
++                        stats->rx_dropped++;
++                        printk(KERN_ERR "%s:%d Should never happen\n", __FUNCTION__, __LINE__);
++                        goto exit;
 +                    }
++                    hisi_can_read(priv, index + 1, cf);
++                    hisi_can_preread(priv, index + 1);
++                    stats->rx_packets++;
++                    stats->rx_bytes += cf->can_dlc;
++                    netif_rx(skb);
++                    can_led_event(dev, CAN_LED_EVENT_RX);
 +                }
 +            }
 +        }
@@ -504,11 +505,12 @@ index 0000000..51f519d
 +    /* start chip and queuing */
 +    hisi_can_init(priv);
 +    priv->free_mailbox = all_send_map;
++    spin_lock_init(&(priv->lock));
 +    netif_start_queue(dev);
 +
 +    for (index = 0; index < 32; index ++) {
 +        if (std_recv_map & (1UL << index)) {
-+            printk(KERN_ERR "Listen standard data packet on mailbox %u\n", index+1);
++            //printk(KERN_ERR "Listen standard data packet on mailbox %u\n", index+1);
 +            hisi_can_preread(priv, index+1);
 +        } else
 +            break;
@@ -543,23 +545,27 @@ index 0000000..51f519d
 +    struct hisi_can_priv *priv = netdev_priv(dev);
 +    struct net_device_stats *stats = &dev->stats;
 +    struct can_frame *cf = (struct can_frame *)skb->data;
++    unsigned long flags;
 +    u8 index;
 +
 +    if (can_dropped_invalid_skb(dev, skb))
 +        return NETDEV_TX_OK;
 +
++    spin_lock_irqsave(&(priv->lock), flags);
++    //printk(KERN_ERR "%s:%d free_mailbox 0x%08x\n", __FUNCTION__, __LINE__, priv->free_mailbox);
 +    for (index = send_start_index; index < 32; index ++) {
-+        if (priv->free_mailbox & (1UL << index))
++        if (priv->free_mailbox & (1UL << index)) {
++            priv->free_mailbox &= ~(1UL << index);
 +            break;
++        }
 +    }
++    spin_unlock_irqrestore(&(priv->lock), flags);
 +
 +    if (unlikely(index == 32)) {
 +        netif_stop_queue(dev);
-+        netdev_err(dev, "BUG! TX buffer full when queue awake!\n");
++        netdev_err(dev, "BUG! TX buffer full when queue awake (0x%08x)!\n", priv->free_mailbox);
 +        return NETDEV_TX_BUSY;
 +    }
-+
-+    priv->free_mailbox &= ~(1UL << index);
 +
 +    can_put_echo_skb(skb, dev, (index - send_start_index));
 +
