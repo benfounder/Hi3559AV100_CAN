@@ -1,7 +1,11 @@
 # Hi3559AV100_CAN
 The CAN Bus driver for Hi3559AV100
 
-Apply the patch to the root directory of kernel 4.9.37. Then reconfigure the kernel to enable Hi3559AV100 CAN option, compile and run.
+Apply the patch to the root directory of kernel 4.9.37
+
+Copy hi3559av100_can.c to drivers/net/can/
+
+Then reconfigure the kernel to enable Hi3559AV100 CAN option, compile and run.
 
 Hope you enjoy it.
 
